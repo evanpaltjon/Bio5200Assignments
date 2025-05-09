@@ -1,0 +1,351 @@
+# Load necessary libraries
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(ggpubr)
+library(scales)
+
+# Function to get neuron data from the API
+get_all_neurons <- function(max_pages = 10, page_size = 500) {
+  base_url <- "http://cng.gmu.edu:8080/api/neuron"
+  all_neurons <- list()
+  
+  for (page in 0:(max_pages - 1)) {
+    tryCatch({
+      query <- list(size = page_size, page = page)
+      response <- GET(url = base_url, query = query)
+      
+      if (status_code(response) != 200) {
+        message("Stopping: Received status code ", status_code(response), " on page ", page)
+        break
+      }
+      
+      json_data <- content(response, as = "text", encoding = "UTF-8")
+      data <- fromJSON(json_data, flatten = TRUE)
+      
+      if (is.null(data$`_embedded`$neuronResources)) {
+        message("No more data available at page ", page)
+        break
+      }
+      
+      all_neurons[[page + 1]] <- data$`_embedded`$neuronResources
+      message("Successfully retrieved page ", page + 1)
+      
+    }, error = function(e) {
+      message("Error on page ", page, ": ", e$message)
+      break
+    })
+  }
+  
+  bind_rows(all_neurons) %>% distinct()
+}
+
+# Retrieve and filter data
+neuron_data <- get_all_neurons(max_pages = 100)
+
+filtered_data <- neuron_data %>%
+  filter(
+    !grepl("experimental manipulation", experiment_condition, ignore.case = TRUE),
+    tolower(species) == "mouse",
+    age_classification %in% c("young", "young adult", "adult"),
+    grepl(paste(c("Humanized ApoE4", "Humanized ApoE3", "ApoE-Knockout", 
+                 "C57BL/6J", "C57BL/6", "wild type"), collapse = "|"), 
+          strain, ignore.case = TRUE),
+    sapply(brain_region, function(x) "hippocampus" %in% tolower(x))
+  )
+
+#To create soma volume plot
+
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(scales)
+library(rstatix)
+
+# Combine and filter specific strains of interest
+filtered_data <- filtered_data %>%
+  mutate(
+    strain = case_when(
+      grepl("C57BL/6J", strain, ignore.case = TRUE) ~ "C57BL/6",
+      grepl("C57BL/6", strain, ignore.case = TRUE) ~ "C57BL/6",
+      grepl("ApoE-Knockout", strain, ignore.case = TRUE) ~ "ApoE-Knockout",
+      grepl("Humanized ApoE3", strain, ignore.case = TRUE) ~ "Humanized ApoE3",
+      grepl("Humanized ApoE4", strain, ignore.case = TRUE) ~ "Humanized ApoE4",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(strain %in% c("C57BL/6", "ApoE-Knockout", "Humanized ApoE3", "Humanized ApoE4")) %>%
+  mutate(volume = as.numeric(volume)) %>%
+  filter(!is.na(volume))
+
+# Generate all unique pairwise strain combinations
+strain_pairs <- combn(unique(filtered_data$strain), 2, simplify = FALSE)
+
+# Compute Wilcoxon test results
+p_table <- map_dfr(strain_pairs, function(pair) {
+  group1 <- filtered_data %>% filter(strain == pair[1]) %>% pull(volume)
+  group2 <- filtered_data %>% filter(strain == pair[2]) %>% pull(volume)
+  test <- wilcox.test(group1, group2)
+  data.frame(
+    group1 = pair[1],
+    group2 = pair[2],
+    p_value = test$p.value,
+    p_signif = symnum(test$p.value, corr = FALSE,
+                      cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                      symbols = c("****", "***", "**", "*", "ns"))
+  )
+})
+
+# Save p-value table
+write.csv(p_table, "soma_volume_filtered_pvalues.csv", row.names = FALSE)
+
+# Create violin plot
+volume_strain_plot <- ggplot(filtered_data, aes(x = reorder(strain, volume, median), y = volume, fill = strain)) +
+  geom_violin(alpha = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.2, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1.5, alpha = 0.4) +
+  stat_compare_means(
+    method = "wilcox.test",
+    comparisons = strain_pairs,
+    label = "p.signif",
+    tip.length = 0.01,
+    step.increase = 0.08,
+    hide.ns = FALSE
+  ) +
+  scale_fill_colorblind() +
+  scale_y_continuous(labels = comma) +
+  coord_flip() +
+  labs(
+    title = "Comparative Soma Volume in Key Mouse Strains",
+    subtitle = "Hippocampal Neurons (Filtered for ApoE-Knockout, ApoE3, ApoE4, C57BL/6)",
+    x = NULL,
+    y = expression(paste("Soma Volume (", mu, m^3, ")")),
+    caption = paste("Figure: Violin plot of soma volume across selected strains.\n",
+                    "n =", nrow(filtered_data), "neurons | Wilcoxon p-values shown")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "none",
+    plot.caption = element_text(size = 10, hjust = 0)
+  )
+
+# Format p-value table for display
+p_table_plot <- p_table %>%
+  arrange(p_value) %>%
+  mutate(p_value = signif(p_value, 3)) %>%
+  ggtexttable(rows = NULL, theme = ttheme("light"))
+
+# Combine plot and table
+combined_plot <- ggarrange(
+  volume_strain_plot,
+  p_table_plot,
+  ncol = 1,
+  heights = c(3, 1.5)
+)
+
+# Save and show the combined figure
+ggsave("filtered_soma_volume_plot_with_table.png", combined_plot, width = 10, height = 8, dpi = 300)
+print(combined_plot)
+
+#To create surface area plot
+
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(scales)
+library(rstatix)
+
+# Combine and filter specific strains of interest
+filtered_data <- filtered_data %>%
+  mutate(
+    strain = case_when(
+      grepl("C57BL/6J", strain, ignore.case = TRUE) ~ "C57BL/6",
+      grepl("C57BL/6", strain, ignore.case = TRUE) ~ "C57BL/6",
+      grepl("ApoE-Knockout", strain, ignore.case = TRUE) ~ "ApoE-Knockout",
+      grepl("Humanized ApoE3", strain, ignore.case = TRUE) ~ "Humanized ApoE3",
+      grepl("Humanized ApoE4", strain, ignore.case = TRUE) ~ "Humanized ApoE4",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(strain %in% c("C57BL/6", "ApoE-Knockout", "Humanized ApoE3", "Humanized ApoE4")) %>%
+  mutate(surface = as.numeric(surface)) %>%
+  filter(!is.na(surface))
+
+# Generate all unique pairwise strain combinations
+strain_pairs <- combn(unique(filtered_data$strain), 2, simplify = FALSE)
+
+# Compute Wilcoxon test results
+p_table <- map_dfr(strain_pairs, function(pair) {
+  group1 <- filtered_data %>% filter(strain == pair[1]) %>% pull(surface)
+  group2 <- filtered_data %>% filter(strain == pair[2]) %>% pull(surface)
+  test <- wilcox.test(group1, group2)
+  data.frame(
+    group1 = pair[1],
+    group2 = pair[2],
+    p_value = test$p.value,
+    p_signif = symnum(test$p.value, corr = FALSE,
+                      cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                      symbols = c("****", "***", "**", "*", "ns"))
+  )
+})
+
+# Save p-value table
+write.csv(p_table, "surface_filtered_pvalues.csv", row.names = FALSE)
+
+# Create violin plot
+surface_strain_plot <- ggplot(filtered_data, aes(x = reorder(strain, surface, median), y = surface, fill = strain)) +
+  geom_violin(alpha = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.2, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1.5, alpha = 0.4) +
+  stat_compare_means(
+    method = "wilcox.test",
+    comparisons = strain_pairs,
+    label = "p.signif",
+    tip.length = 0.01,
+    step.increase = 0.08,
+    hide.ns = FALSE
+  ) +
+  scale_fill_colorblind() +
+  scale_y_continuous(labels = comma) +
+  coord_flip() +
+  labs(
+    title = "Comparative Surface Area Across Key Mouse Strains",
+    subtitle = "Hippocampal Neurons (Filtered for ApoE-Knockout, ApoE3, ApoE4, C57BL/6)",
+    x = NULL,
+    y = expression(paste("Surface Area (", mu, m^2, ")")),
+    caption = paste("Figure: Violin plot of surface area across selected strains.\n",
+                    "n =", nrow(filtered_data), "neurons | Wilcoxon p-values shown")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "none",
+    plot.caption = element_text(size = 10, hjust = 0)
+  )
+
+# Format p-value table for display
+p_table_plot <- p_table %>%
+  arrange(p_value) %>%
+  mutate(p_value = signif(p_value, 3)) %>%
+  ggtexttable(rows = NULL, theme = ttheme("light"))
+
+# Combine plot and table
+combined_plot <- ggarrange(
+  surface_strain_plot,
+  p_table_plot,
+  ncol = 1,
+  heights = c(3, 1.5)
+)
+
+# Save and show the combined figure
+ggsave("filtered_surface_plot_with_table.png", combined_plot, width = 10, height = 8, dpi = 300)
+print(combined_plot)
+
+# To create soma surface area plot
+
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(scales)
+library(rstatix)
+
+# Combine and filter specific strains of interest
+filtered_data <- filtered_data %>%
+  mutate(
+    strain = case_when(
+      grepl("C57BL/6J", strain, ignore.case = TRUE) ~ "C57BL/6",
+      grepl("C57BL/6", strain, ignore.case = TRUE) ~ "C57BL/6",
+      grepl("ApoE-Knockout", strain, ignore.case = TRUE) ~ "ApoE-Knockout",
+      grepl("Humanized ApoE3", strain, ignore.case = TRUE) ~ "Humanized ApoE3",
+      grepl("Humanized ApoE4", strain, ignore.case = TRUE) ~ "Humanized ApoE4",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(strain %in% c("C57BL/6", "ApoE-Knockout", "Humanized ApoE3", "Humanized ApoE4")) %>%
+  mutate(soma_surface = as.numeric(soma_surface)) %>%
+  filter(!is.na(soma_surface))
+
+# Calculate IQR and remove outliers
+Q1 <- quantile(filtered_data$soma_surface, 0.25)
+Q3 <- quantile(filtered_data$soma_surface, 0.75)
+IQR <- Q3 - Q1
+
+# Filter data to remove outliers
+filtered_data_no_outliers <- filtered_data %>%
+  filter(soma_surface >= (Q1 - 1.5 * IQR) & soma_surface <= (Q3 + 1.5 * IQR))
+
+# Generate all unique pairwise strain combinations
+strain_pairs <- combn(unique(filtered_data_no_outliers$strain), 2, simplify = FALSE)
+
+# Compute Wilcoxon test results
+p_table <- map_dfr(strain_pairs, function(pair) {
+  group1 <- filtered_data_no_outliers %>% filter(strain == pair[1]) %>% pull(soma_surface)
+  group2 <- filtered_data_no_outliers %>% filter(strain == pair[2]) %>% pull(soma_surface)
+  test <- wilcox.test(group1, group2)
+  data.frame(
+    group1 = pair[1],
+    group2 = pair[2],
+    p_value = test$p.value,
+    p_signif = symnum(test$p.value, corr = FALSE,
+                      cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                      symbols = c("****", "***", "**", "*", "ns"))
+  )
+})
+
+# Save p-value table
+write.csv(p_table, "soma_surface_no_outliers_filtered_pvalues.csv", row.names = FALSE)
+
+# Create violin plot for soma_surface without outliers
+soma_surface_strain_plot <- ggplot(filtered_data_no_outliers, aes(x = reorder(strain, soma_surface, median), y = soma_surface, fill = strain)) +
+  geom_violin(alpha = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.2, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1.5, alpha = 0.4) +
+  stat_compare_means(
+    method = "wilcox.test",
+    comparisons = strain_pairs,
+    label = "p.signif",
+    tip.length = 0.01,
+    step.increase = 0.08,
+    hide.ns = FALSE
+  ) +
+  scale_fill_colorblind() +
+  scale_y_continuous(labels = comma) +
+  coord_flip() +
+  labs(
+    title = "Comparative Soma Surface Area Across Key Mouse Strains",
+    subtitle = "Hippocampal Neurons (Filtered for ApoE-Knockout, ApoE3, ApoE4, C57BL/6)",
+    x = NULL,
+    y = expression(paste("Soma Surface Area (", mu, m^2, ")")),
+    caption = paste("Figure: Violin plot of soma surface area across selected strains.\n",
+                    "n =", nrow(filtered_data_no_outliers), "neurons | Wilcoxon p-values shown")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "none",
+    plot.caption = element_text(size = 10, hjust = 0)
+  )
+
+# Format p-value table for display
+p_table_plot <- p_table %>%
+  arrange(p_value) %>%
+  mutate(p_value = signif(p_value, 3)) %>%
+  ggtexttable(rows = NULL, theme = ttheme("light"))
+
+# Combine plot and table
+combined_plot <- ggarrange(
+  soma_surface_strain_plot,
+  p_table_plot,
+  ncol = 1,
+  heights = c(3, 1.5)
+)
+
+# Save and show the combined figure
+ggsave("soma_surface_no_outliers_filtered_plot_with_table.png", combined_plot, width = 10, height = 8, dpi = 300)
+print(combined_plot)
