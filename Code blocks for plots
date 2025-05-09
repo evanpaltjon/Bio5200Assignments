@@ -6,6 +6,8 @@ library(purrr)
 library(ggplot2)
 library(ggpubr)
 library(scales)
+library(ggthemes)
+
 
 # Function to get neuron data from the API
 get_all_neurons <- function(max_pages = 10, page_size = 500) {
