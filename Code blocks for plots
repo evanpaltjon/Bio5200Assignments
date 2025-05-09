@@ -43,7 +43,7 @@ get_all_neurons <- function(max_pages = 10, page_size = 500) {
 }
 
 # Retrieve and filter data
-neuron_data <- get_all_neurons(max_pages = 100)
+neuron_data <- get_all_neurons(max_pages = 10)
 
 filtered_data <- neuron_data %>%
   filter(
